@@ -5,19 +5,18 @@ import sys, socket, select, time, json, random, math
 # Your ID number
 my_id = sys.argv[1]
 
-
 # The ID numbers of all the other replicas
 replica_ids = sys.argv[2:]
 
 
 
-# number of replicas needed to reach quorum, and the number of those that we have gotten
+# majority of replicas, votes we've gotten
 MAJORITY = int(math.ceil(float((len(replica_ids) + 1)) / 2.0))
 #this is 1 bc always agrees with itself
 RESP_NUM = 1
 
 
-# The timestamp of our last timeout, and the random time until our next timeout respectively
+# last timeout, random time until our next timeout
 LAST_TO = None
 ELECTION_TO = None
 
@@ -27,21 +26,19 @@ cur_role = 'follower'
 
 cur_leader  = 'FFFF'
 
-# Which replica we voted for
+#who we voted for
 my_vote  = None
 
-# The term number that this replica is on
 TERM = 1
 
 
-
-# The log for this replica (initialize with empty value at 0 so we can use 1 indexing)
+# The log for this replica
 LOG = [{}]
 
-# The key/value pairs for this replica
+# The key/value pairs
 PAIRS = {}
 
-# The timer that the replica will use if it is a leader to send appendRCs
+# The timerwill use if it is a leader to send appendRCs
 APP_TIMER = None
 APP_LIMIT = 100
 
@@ -53,14 +50,16 @@ COMMIT_INDEX = 0
 LAST_APPLIED = 0
 
 
-# ------- ONLY USED BY LEADER ---------
-# next log entry index to send to each server
+#FOR LEADER ONLY
+# next log entry index to send
 NEXT_INDICES = {}
-# highest log index that we know each server has replicated
+# highest log index each server has replicated
 MATCH_INDEX = {}
-# Map from replica to timeout.  Allows us to skip heartbeat for replicas that were sent updates
+# Map from replica to timeout
+# so we can skip heartbeat for replicas that were sent updates
 HB_TO_MAP = {}
 HB_LIMIT = 50
+
 # Number of updates in each batch of appends
 SEEN = 0
 
@@ -74,7 +73,7 @@ SELECT_WAIT_TIME = 0.01 # 10 milliseconds
 TERMINATOR = b'}\n'
 buffer = b''
 
-# Method to receive from new socket
+# receiving messages from socket
 def recv_msgs(sock):
     global buffer
 
@@ -93,29 +92,29 @@ def recv_msgs(sock):
 
     return msgs
 
-# Handles resetting the election timeout countdown and picking a new random timeout
+# resetting  election timeout countdown and picks new random timeout
 def reset_timeout():
     global LAST_TO
     global ELECTION_TO
     # multiply by 1000 to get in ms 
     LAST_TO = float(time.time() * 1000)
-    # random number for timeout
     ELECTION_TO = random.randrange(150, 300)
+
 
 def client_response(msg, mtype):
     return {'src': my_id, 'dst': msg['src'], 'leader': cur_leader , 'MID': msg['MID'], 'type': mtype}
 
-# Handles interaction with the client
+#interacts with  client
 def client_message(msg):
     global PAIRS
     global LOG
     global COUNT
     global SEEN
-    # If there is aknown known leader, and we are not that leader, redirect to the leader
+    # redirect to the leader if needed
     if cur_leader  != 'FFFF' and cur_leader  != my_id:
         msg = client_response(msg, 'redirect')
         sock.send(json.dumps(msg).encode() + b'\n')
-    # If we are the leader, add the entry to our log
+    # If leader, add the entry to our log
     elif cur_leader  == my_id:
         if msg['type'] == 'get':
             reply_to_client(msg)
@@ -124,39 +123,40 @@ def client_message(msg):
             log_entry['term'] = TERM
             LOG.append(log_entry)
             send_appends()
-    # Else there is no leader (perhaps due to election), fail request
+    #no leader so fail request
     else:
         msg = client_response(msg, 'fail')
         sock.send(json.dumps(msg).encode() + b'\n')
 
-# Allows the leader to reply to the client about the given log entry
+# reply to the client about log entry
 def reply_to_client(entry):
     global PAIRS
     response = client_response(entry, 'ok')
-    # If the entry is a get request, we need to add the requested value to the reply
+    # for get request, add  requested value to reply
     if entry['type'] == 'get':
-        # If we have an entry for the requested key, return the associated value
+        #return the associated value for the key
         if entry['key'] in PAIRS:
             response['value'] = PAIRS[entry['key']]
-        # Else, return empty string
+        # Else, empty
         else:
             response['value'] = ''
     sock.send(json.dumps(response).encode() + b'\n')
 
-# Sends a vote request to every other replica
+# Sends a vote request
 def send_vote():
     global LOG
-    # We can use -1 for the initial election, candidates will vote for these only if their logs are empty too
+    #-1 for the initial election
+    #candidates vote for these only if their logs are empty
     last_term = -1
     last_index = -1
-    # If log is not empty, use index and term of last element in log
+    # If log not empty, use index and term of last element in log
     if len(LOG) > 1:
         last_index = len(LOG) - 1
         last_term = LOG[last_index]['term']
     vote_req = {'src': my_id, 'dst': 'FFFF', 'leader': cur_leader , 'type': 'vote-req', 'term': TERM, 'last-index': last_index, 'last-term': last_term}
     sock.send(json.dumps(vote_req).encode() + b'\n')
 
-# Triggers the election process by making this replica a candidate and upping the term, then asking for votes
+# Triggers the election
 def trigger_election():
     global cur_role
     global TERM
@@ -166,56 +166,55 @@ def trigger_election():
     cur_leader  = 'FFFF'
     RESP_NUM = 1
     TERM += 1
-    # start timeout again in case there is a split vote
+    # start timeout again if split vote
     reset_timeout()
     send_vote()
 
-# Checks if the candidate meets the requirements in 5.4.1
+#5.4.1 requirements
 def check_log_reqs(msg):
     global LOG
-    # -1 for last term and index means an empty log.  This happens in startup, so if our log is also empty, we vote.
+    #if our log is also empty, we vote
     if msg['last-term'] == -1 and msg['last-index'] == -1:
         return len(LOG) == 1
-    # If our log is empty, theirs must be at least as up to date as ours, so always true
+    # always true
     if len(LOG) == 1:
         return True
-    # If their last term is larger than ours, return true
+    #their last term is larger than ours
     if LOG[len(LOG) - 1]['term'] < msg['last-term']:
         return True
-    # In the case of same last terms, compare log size
+    # for same last terms, compare log size
     elif LOG[len(LOG) - 1]['term'] == msg['last-term']:
         return msg['last-index'] >= len(LOG) - 1
-    # If their last term is smaller, reject it
+    # their last term is smaller, reject
     else:
         return False
 
-# Checks if we have already voted this term.  Returns false is noe vote this term or if we voted for the given
-# replica this term
+# Checks if we have already voted
 def if_voted(rid):
-    # If voted for is none, we obviously have not voted yet
+    # have not voted yet
     if my_vote  == None:
         return False
-    # Otherwise, return false if we voted for the given ID, repeat votes are allowed
+    # false if we voted for the given ID
     return my_vote  != rid
 
-# Determines whether or not to cast a vote for a given candidate
+# if should vote for them
 def handle_vote(msg):
     global cur_role
     global TERM
     global cur_leader 
     global my_vote 
-    # If we encounter a vote req with a higher term, we vote no matter what
-    # If we were a candidate or a leader with a lower term, revert to a follower since you clearly goofed up
+    # if has a higher term, we vote
+    # if lower term, revert to a follower since messed up
     if msg['term'] > TERM:
         cur_role = 'follower'
         TERM = msg['term'] 
         cur_leader  = 'FFFF'
         my_vote  = None
-    # If candidate log is up to date and we have not voted in this term, vote
+    # candidate log up to date and not voted
     if check_log_reqs(msg) and not if_voted(msg['src']):
         my_vote  = msg['src']
         vote_ack = {'src': my_id, 'dst': msg['src'], 'leader': cur_leader , 'type': 'vote-accept', 'term': TERM}
-        # Reset our timeout as we anticipate this candidate becomming the leader
+        # Reset our timeout
         reset_timeout()
         sock.send(json.dumps(vote_ack).encode() + b'\n')
     # reject
@@ -223,7 +222,7 @@ def handle_vote(msg):
         vote_rej = {'src': my_id, 'dst': msg['src'], 'leader': cur_leader , 'type': 'vote-reject', 'term': TERM}
         sock.send(json.dumps(vote_rej).encode() + b'\n')
 
-# Increments the number of votes received and crowns a leader if majority was reached
+#new leader if majority
 def vote_accept():
     global cur_role
     global cur_leader 
@@ -232,11 +231,9 @@ def vote_accept():
     global NEXT_INDICES
     global MATCH_INDEX
     global APP_TIMER
-    print(my_id + ' accepted by: ' + msg['src'] + ' in term ' + str(TERM))
     if cur_role == 'candidate':
         RESP_NUM += 1
         if RESP_NUM >= MAJORITY:
-            print(my_id + ' was crowned as leader! Long may they reign!')
             cur_role = 'leader'
             cur_leader  = my_id
             RESP_NUM = 1
@@ -246,12 +243,11 @@ def vote_accept():
             NEXT_INDICES = {}
             MATCH_INDEX = {}
             for rid in replica_ids:
-                # Since we start the log with an empty value at index 0, this works
                 NEXT_INDICES[rid] = len(LOG)
                 MATCH_INDEX[rid] = 0
                 HB_TO_MAP[rid] = float(time.time() * 1000)
 
-# Handles a rejected vote.  If the term in the rejection is higher than ours, become a follower and change term to match
+# handles rejected vote
 def vote_reject(msg):
     global cur_role
     global TERM
@@ -260,7 +256,7 @@ def vote_reject(msg):
     global my_vote 
     print(my_id + ' rejected by: ' + msg['src'])
     if cur_role == 'candidate':
-        # In this case, we are behind and should adopt the leader and term of the replica that replied, becomming a follower
+        # becomming a follower
         if msg['term'] > TERM:
             cur_role = 'follower'
             TERM = msg['term']
@@ -269,28 +265,26 @@ def vote_reject(msg):
             my_vote  = None
             reset_timeout()
 
-# Checks that the entry at index has term == term
 def check_prev_term(index, term):
     global LOG
-    # If index is 0, this is our first append so accept it
+    #accept
     if index == 0:
         return True
     if len(LOG) == 1:
         return False
-    # Obviously we need the index to be within our log
+    # need  index to be within our log
     if index < len(LOG):
         return LOG[index]['term'] == term
     else:
         return False
 
-# Updates the log with the new entries
+# Updates log
 def update_log(start_index, entries):
     global LOG
     log_index = start_index
     entry_index = 0
-    # If we see an inconsistancy, set this flag to overwrite all subsequent entries
     overwrite = False
-    # Loop through and check entries until we reach the end of the list
+    # Loop and check entries
     while log_index < len(LOG) and entry_index < len(entries):
         # If overwrite is set, replace the entry
         if overwrite:
@@ -298,65 +292,63 @@ def update_log(start_index, entries):
             log_index += 1
             entry_index += 1
         else:
-            # If new and existing entries at the same index have differing terms, we have a conflict and must overwrite
-            # the current entry and all following ones
+            # if conflict then overwrite current entry and all following
             if LOG[log_index]['term'] != entries[entry_index]['term']:
                 overwrite = True
                 LOG[log_index] = entries[entry_index]
             log_index += 1
             entry_index += 1
 
-    # Append any remaing entries to the end of log
+    # Append remaing
     while entry_index < len(entries):
         LOG.append(entries[entry_index])
         entry_index += 1
 
 
-# Handles an AppendRC message
+#AppendRC messages
 def handle_append(msg):
     global cur_role
     global TERM
     global cur_leader 
     global COMMIT_INDEX
-    # In the case of heartbeat, we do not want to reply so initialize to None
+    #for  heartbeat, initialize to None
     reply = None
-    # No matter what state we are in, we should become follower if the leader has larger term than us
+    # should be  follower if the leader has larger term
     if msg['term'] > TERM:
         cur_role = 'follower'
         TERM = msg['term']
         cur_leader  = msg['leader']
-    # If we are a leader and our term is bigger, send a fail so this other leader knows about us
+    # if leader and bigger term, send a fail
     elif cur_role == 'leader' or msg['term'] < TERM:
         reply = {'src': my_id, 'dst': msg['src'], 'leader': cur_leader , 'type': 'append-reply', 'term': TERM, 'success': False}
         sock.send(json.dumps(reply).encode() + b'\n')
         return
-    # Always update the leader for followers (just in case)
+    # update the leader for followers
     else:
         cur_leader  = msg['leader']
 
     # reset timeout
     reset_timeout()
 
-    # Only update log and commit index if we are a follower
     if cur_role == 'follower':
-        # If entries are not empty, we should try to update log
+        # If not empty, try to update log
         if len(msg['entries']) > 0:
-            # if the entry at prevIndex has the same term as prevLogTerm, we can proceed
+            # if has the same term, continue
             if check_prev_term(msg['prev-log-index'], msg['prev-log-term']):
                 reply = {'src': my_id, 'dst': msg['src'], 'leader': cur_leader , 'type': 'append-reply', 'term': TERM, 'success': True,
                 'new_index': msg['prev-log-index'] + len(msg['entries'])}
                 sock.send(json.dumps(reply).encode() + b'\n')
                 update_log(msg['prev-log-index'] + 1, msg['entries'])
-            # Otherwise, send fail message
+            # else fail
             else:
                 reply = {'src': my_id, 'dst': msg['src'], 'leader': cur_leader , 'type': 'append-reply', 'term': TERM, 'success': False}
                 sock.send(json.dumps(reply).encode() + b'\n')
 
-        # Always update commitIndex if leader has a higher one. Take min of that index and our log length
+        # Always update if leader has a higher one
         if msg['leader-commit'] > COMMIT_INDEX:
             COMMIT_INDEX = min(msg['leader-commit'], len(LOG) - 1)
 
-# Handles the response to an append message
+# response to append message
 def append_reply(msg):
     global cur_role
     global cur_leader 
@@ -365,73 +357,68 @@ def append_reply(msg):
     global NEXT_INDICES
     global MATCH_INDEX
     global ACCEPT_SEEN
-    # If the append succeeded, update match and next indices for replica
+    # update match and next indices for replica
     if msg['success']:
         NEXT_INDICES[msg['src']] = msg['new_index'] + 1
         MATCH_INDEX[msg['src']] = msg['new_index']
-    # Otherwise, figure out why it failed
+    # why failed?
     else:
-        # If the term is larger, there is a more up-to-date leader out there, revert to follower
+        #revert to follower
         if msg['term'] > TERM:
             cur_role = 'follower'
             TERM = msg['term']
             cur_leader  = msg['leader']
             my_vote  = None
-        # Else, we need to decrement next index for the replica and try again
+        # decrement next index and try again
         else:
             NEXT_INDICES[msg['src']] = NEXT_INDICES[msg['src']] - 1
 
-# Checks that the applyIndex is up to date.  If it is not, it increments it and applies the changes up to the new index.
-# ****LEADER ONLY***** Sends replies to client for each change applied from the log
+
 def check_apply_index():
     global LAST_APPLIED
     global COMMIT_INDEX
     global LOG
     global PAIRS
-    # If we can commit more changes, do it
+    # If can commit more
     if COMMIT_INDEX > LAST_APPLIED:
         to_apply = LOG[LAST_APPLIED + 1: COMMIT_INDEX + 1]
         for entry in to_apply:
-            # If the entry is a put, execute the put by storing the key/value pair
+            # execute put by storing pair
             if entry['type'] == 'put':
                 PAIRS[entry['key']] = entry['value']
-            # If we are the leader, reply to the client that we have done the operation
+            # reply to client
             if cur_role == 'leader':
                 reply_to_client(entry)
         LAST_APPLIED = COMMIT_INDEX
 
-# Searches through the matchIndices and tries to find value N that is common to the majority
-# and is greater than our commitIndex.  If such a value exists, make it the new commitIndex
+
 def check_commit_index():
     global COMMIT_INDEX
     match_ind = list(MATCH_INDEX.values())
-    # sort the list so the following loop logic works
+    # sort the list
     match_ind.sort()
     index_occurances = {}
-    # iterate through the keys
+    # iterate through keys
     for ind in match_ind:
-        # since our list is sorted, every key in the map is either this index or a smaller index.
-        # since we know that this index was matched, any smaller index was also matched so increment them as well.
+        # every key in  map is either this index or smaller
         for key in index_occurances:
             index_occurances[key] = index_occurances[key] + 1
-        # if this is the first instance of the index, start it at 2 to account for the leader having this index too
         if ind not in index_occurances:
             index_occurances[ind] = 2
     # temp value for new commitIndex
     new_commit = COMMIT_INDEX
-    # loop through index occurances and see if any occur a majority of the time
+    # loop through index occurances
     for key in index_occurances:
-        # if the index has a majoirty, make it the new index if it exceeds the current value
+        # make new index if exceeds current value
         if index_occurances[key] >= MAJORITY:
             new_commit = max(new_commit, key)
-    # Update the commit index
+    # Update commit index
     if COMMIT_INDEX == 0:
         COMMIT_INDEX = new_commit
     elif LOG[new_commit]['term'] == TERM:
         COMMIT_INDEX = new_commit
 
-# Checks for any followers that have nextIndex < our last log index.
-# If one is found, send an AppendRC to update it
+
 def send_appends():
     global HB_TO_MAP
     for rid in replica_ids:
@@ -442,13 +429,13 @@ def send_appends():
                 end_ind = 500 + next_ind
             append = {'src': my_id, 'dst': rid, 'leader': cur_leader , 'type': 'append-entries', 'term': TERM, 'leader-commit': COMMIT_INDEX,
             'prev-log-index': next_ind - 1, 'prev-log-term': None, 'entries': LOG[next_ind:end_ind]}
-            # If this is not the first append, we will need to include the term
+            # need to include the term
             if next_ind > 1:
                 append['prev-log-term'] = LOG[next_ind - 1]['term']
             sock.send(json.dumps(append).encode() + b'\n')
             HB_TO_MAP[rid] = float(time.time() * 1000)
 
-# Start initial countdown for first timeout to trigger election
+# Start initial countdown to trigger election
 reset_timeout()
 while True:
     ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
@@ -464,29 +451,27 @@ while True:
                 vote_accept()
             elif msg['type'] == 'vote-reject':
                 vote_reject(msg)
-            # Handle append-entries
+            # append-entries
             elif msg['type'] == 'append-entries':
                 handle_append(msg)
-            # If the leader, Handle the reply to the append
+            # If  leader, reply to the append
             elif msg['type'] == 'append-reply':
                 if cur_role == 'leader':
                     append_reply(msg)
                    
 
-    # If the leader, check if we have a majority of replicas that have accepted N changes where N > committed
-    # If so, commit all changes up to N
+    # check if majority have accepted N changes 
     if cur_role == 'leader':
         check_commit_index()
 
-    # Check if the commitIndex is greater than lastApplied, if so, apply all changes up to that point
     check_apply_index()
 
-    # Leaders do not care about timeouts.  Only enter if not a leader
+    # not leader
     if cur_role != 'leader':
         if ((time.time() * 1000) - LAST_TO) > ELECTION_TO:
             trigger_election()
 
-    # This loop is for the leader to send regular heartbeats to prevent unneeded elections
+    # heartbeats to prevent elections
     if cur_role == 'leader':
         if ((time.time() * 1000) - APP_TIMER) >= APP_LIMIT:
             send_appends()
@@ -497,6 +482,6 @@ while True:
                 hb = {'src': my_id, 'leader': cur_leader , 'type': 'append-entries', 'term': TERM, 'leader-commit': COMMIT_INDEX, 'entries': []}
                 # Reset heartbeat timer
                 HB_TO_MAP[rid] = float(time.time() * 1000)
-                # Send heartbeat to each replica
+                # Send heartbeat
                 hb['dst'] = rid
                 sock.send(json.dumps(hb).encode() + b'\n')
