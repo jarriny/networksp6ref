@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+
+import sys, socket, select, time, json, random
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(my_id)
+
+last = 0
+
+SELECT_WAIT_TIME = 0.01 # 10 milliseconds
+TERMINATOR = b'}\n'
+buffer = b''
+
+# determines the number of votes needed to win the election
+majority = (len(replica_ids) / 2) + 1
+
+# sets initial values for replica
+last_time = time.time()
+cur_leader = "FFFF"
+cur_term = 0
+cur_log = {}
+my_vote = None
+votes = 0
+
+# start as follower
+cur_role = "Follower"
+
+# gets the length of the timeout
+def get_timeout():
+	
+	if cur_role == 'Leader':
+		# does a heartbeat on a constant interval
+		timeout = 0.1
+	else:
+		# creates a random timeout for all non-leaders
+		# (recommended by Akash in OH)
+		timeout = random.uniform(0.150, 0.300)
+
+	return timeout
+
+timeout = get_timeout()
+
+# Receive 
+def recv_msgs(sock):
+	global buffer
+
+	fresh_buf = sock.recv(16384)
+
+	# is this sock shutting down?
+	if len(fresh_buf) == 0:
+			return None
+
+	buffer += fresh_buf	
+
+	msgs = []
+	while TERMINATOR in buffer:
+		position = buffer.find(TERMINATOR) + len(TERMINATOR)
+		msgs.append(json.loads(buffer[:position - 1].decode()))  # -1 to remove the \n, which json.loads won't want
+		buffer = buffer[position:]
+
+	return msgs
+
+# ------------------------------------------------------------
+# GENERAL MESSAGE HANDLING FUNCTIONS
+
+# sends a fail message
+def fail_msg(dst, mid):
+
+	# print(dst,': Sending Fail Message')
+	# fail message format
+	msg = {
+		"src": my_id,
+		"dst": dst,
+		"leader": cur_leader,
+		"type": "fail",
+		"MID": mid,
+	}
+	check_msg(msg)
+
+# sends a message to a socket
+def send_msg(msg):
+	# print("Sending")
+	# sock.send(f"{json.dumps(msg)}\n".encode())
+	sock.send(json.dumps(msg).encode() + b'\n')
+
+# determines what to do depending on type of message recieved
+def check_msg(msg):
+	if msg["type"] == "get":
+		# print("GET")
+		get_msg(msg)
+	elif msg["type"] == "put":
+		# print("PUT")
+		put_msg(msg)
+	elif msg["type"] == "heartbeat":
+		handle_heartbeat(msg)
+	elif msg["type"] == "vote":
+		handle_vote(msg)
+	elif msg["type"] == "request_vote":
+		handle_vote_req(msg)
+
+#sends a heartbeat
+def send_heartbeat():
+
+	# format of heartbeat message
+	send_msg({
+		"src": my_id,
+		"dst": "FFFF",
+		"type": "heartbeat",
+		"leader": my_id,
+		"term": cur_term,
+	})
+
+def handle_heartbeat(msg):
+	global last_time, timeout, cur_leader, cur_term
+
+	term = int(msg["term"])
+	src = msg["src"]
+	if src != cur_leader:
+		# change leader to src and change role to follower
+		cur_leader = src
+		cur_role = "Follower"
+		cur_term = term
+
+	else:
+		# reset timeout
+		last_time = time.time()
+
+def get_msg(msg):
+	global last_time, timeout, cur_leader, cur_term
+
+	key = msg["key"]
+	mid = msg["MID"]
+	other_src = msg["src"]
+
+	# determine role
+	if cur_role == 'Leader':
+		if key in cur_log:
+			# send ok msg format
+			send_msg({
+				"src": my_id,
+				"dst": other_src,
+				"MID": mid,
+				"leader": my_id,
+				"type": "ok",
+				"value": cur_log[key],
+			})
+		else:
+			# send a failure
+			fail_msg(other_src, mid)
+	else:
+		# send redirect if not the leader
+		send_msg({
+			"src": my_id,
+			"dst": other_src,
+			"type": "redirect",
+			"leader": cur_leader,
+			"MID": mid,
+		})
+
+def put_msg(msg):
+	global last_time, timeout, cur_leader, cur_term
+	
+	key = msg["key"]
+	val = msg["value"]
+	other_src = msg["src"]
+	mid = msg["MID"]
+
+	# determine role
+	if cur_role == 'Leader':
+		cur_log[key] = val
+		# send ok message format
+		send_msg({
+			"src": my_id,
+			"dst": other_src,
+			"type": "ok",
+			"leader": my_id,
+			"MID": mid,
+		})
+	else:
+		# print("Redirect")
+		# send redirect if not leader
+		send_msg({
+			"src": my_id,
+			"dst": other_src,
+			"type": "redirect",
+			"leader": cur_leader,
+			"MID": mid,
+		})
+
+# -----------------------------------------------------------------
+# TIMEOUT HANDLING FUNCTIONS
+
+# checks for timeout
+def check_timeout():
+	global last_time, timeout
+	cur_time = time.time()
+
+	if cur_time >= (last_time + timeout):
+		handle_timeout()
+		last_time = cur_time
+		timeout = get_timeout()
+
+# handles timeout depending on role
+def handle_timeout():
+	global last_time, timeout, cur_role, votes
+	# print("Handling Timeout")
+	
+	if cur_role == 'Follower':
+		# change to candidate and begin election, voting for self
+		cur_role = 'Candidate'
+		votes = 1
+		election()	
+	elif cur_role == 'Candidate':
+		election()
+	else:
+		send_heartbeat()
+
+# ---------------------------------------------------
+# ELECTION FUNCTIONS
+
+# candidate starts an election
+def election():
+	global last_time, timeout, cur_leader, cur_term
+
+	# print("Election Starting")
+	# vote for self and increment term
+	my_vote = my_id
+	cur_term += 1
+
+	# request_vote message format
+	send_msg({
+		"src": my_id,
+		"dst": "FFFF",
+		"type": "request_vote",
+		"term": cur_term,
+		"leader": cur_leader
+	})
+
+# votes for a candidate replica in leader election
+def vote(rep_id):
+	global last_time, timeout, cur_leader, cur_term
+
+	# sets voting value
+	my_vote = rep_id
+
+	send_msg({
+		"src": my_id,
+		"dst": rep_id,
+		"type": "vote",
+		"leader": cur_leader,
+		"term": cur_term,
+	})
+
+# responds to a vote depending on role
+def handle_vote(msg):
+	global last_time, timeout, cur_leader, cur_term, cur_role, votes
+	
+	term = int(msg["term"])
+	src = msg["src"]
+	# determine role
+	if cur_role == 'Leader':
+		# do nothing
+		pass
+
+	elif cur_role == 'Candidate':
+		if term > cur_term:
+			cur_term = term
+
+			# vote and turn to a follower
+			vote(src)
+			cur_role = "Follower"
+		else:
+			votes += 1
+			if votes >= majority:
+				cur_leader = my_id
+				cur_role = 'Leader'
+				send_heartbeat()
+
+	elif cur_role == "Follower":
+		# change term if recieved term is higher
+		if  term > cur_term:
+			cur_term = term
+			vote(src)
+		elif (term == cur_term and my_vote == src) or (term == cur_term and my_vote == None):
+			vote(src)
+
+		# reset timer
+		last_time = time.time()
+
+# requests a vote response depending on role
+def handle_vote_req(msg):
+	global last_time, timeout, cur_leader, cur_term
+
+	term = int(msg["term"])
+	src = msg["src"]
+	# determines role
+	if cur_role == 'Leader' or cur_role == 'Candidate':
+
+		# get term from message and vote for highest term
+		if term > cur_term:
+			cur_term = term
+			vote(src)
+
+	elif cur_role == "Follower":
+
+		# get term from message and vote for highest term
+		if  term > cur_term:
+			cur_term = term
+			vote(src)
+		elif (term == cur_term and my_vote == src) or (term == cur_term and my_vote == None):
+			vote(src)
+
+		last_time = time.time()
+
+# --------------------------------------------------------
+# RUNS THE PROGRAM
+
+while True:
+
+	# always check for timeouts
+	check_timeout()
+	ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
+	
+	if sock in ready:
+		msgs = recv_msgs(sock)
+
+		for msg in msgs:
+
+			check_msg(msg)
